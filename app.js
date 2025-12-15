@@ -1,563 +1,474 @@
-
-(() => {
-  const STORAGE_KEY = "stockpilot_v1";
-
+/* global QRCodeStyling */
+document.addEventListener("DOMContentLoaded", () => {
+  // ---------------- helpers ----------------
   const $ = (id) => document.getElementById(id);
-  const fmtEUR = (n) => new Intl.NumberFormat("de-DE", { style:"currency", currency:"EUR" }).format(n || 0);
-  const fmtDate = (ts) => new Intl.DateTimeFormat("de-DE", {
-    year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit"
-  }).format(new Date(ts));
+  const on = (el, ev, fn) => { if (el) el.addEventListener(ev, fn); };
+  const setText = (el, txt) => { if (el) el.textContent = txt; };
+  const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
-  const uid = () => Math.random().toString(36).slice(2, 10) + "-" + Date.now().toString(36);
-
-  const state = loadState();
-
-  // Elements
-  const itemsTbody = $("itemsTable").querySelector("tbody");
-  const historyTbody = $("historyTable").querySelector("tbody");
-
-  const formItem = $("formItem");
-  const formMove = $("formMove");
-
-  const moveItem = $("moveItem");
-  const moveType = $("moveType");
-  const search = $("search");
-  const filterStock = $("filterStock");
-
-  const modal = $("modal");
-  const modalClose = $("modalClose");
-  const modalForm = $("modalForm");
-
-  // Init
-  hydrateUI();
-
-  // --- Events: Add Item ---
-  formItem.addEventListener("submit", (e) => {
-    e.preventDefault();
-
-    const sku = $("sku").value.trim();
-    const name = $("name").value.trim();
-    const category = $("category").value.trim();
-    const supplier = $("supplier").value.trim();
-    const cost = toNum($("cost").value);
-    const price = toNum($("price").value);
-    const initialStock = toInt($("initialStock").value);
-
-    if (!sku || !name) return toast("SKU und Name sind Pflicht.");
-    if (existsSku(sku)) return toast("SKU existiert bereits. Bitte eindeutig halten.");
-    if (cost < 0 || price < 0) return toast("Preise dürfen nicht negativ sein.");
-    if (initialStock < 0) return toast("Startbestand darf nicht negativ sein.");
-
-    const item = { id: uid(), sku, name, category, supplier, cost, price, stock: initialStock };
-    state.items.push(item);
-
-    // Optional: Startbestand als Bewegung loggen (audit)
-    if (initialStock > 0) {
-      state.moves.unshift({
-        id: uid(),
-        ts: Date.now(),
-        type: "adjust",
-        itemId: item.id,
-        qty: initialStock,
-        unit: cost,
-        note: "Startbestand"
-      });
-    }
-
-    persist();
-    formItem.reset();
-    $("initialStock").value = "0";
-    hydrateUI();
-    toast("Artikel gespeichert.");
-  });
-
-  // Demo Data
-  $("btnDemo").addEventListener("click", () => {
-    if (state.items.length) return toast("Demo nur sinnvoll in leerem System (oder reset).");
-    const demo = [
-      { sku:"A-1001", name:"Schrauben M6 (100er)", category:"Zubehör", supplier:"Fix&Co", cost:4.20, price:8.90, stock:25 },
-      { sku:"B-2002", name:"Kabelbinder (50er)", category:"Zubehör", supplier:"Fix&Co", cost:2.10, price:5.50, stock:8 },
-      { sku:"C-3003", name:"WD-40 400ml", category:"Werkstatt", supplier:"IndustriePartner", cost:3.30, price:7.90, stock:3 },
-    ];
-    demo.forEach(d => state.items.push({ id: uid(), ...d }));
-    state.moves.unshift({
-      id: uid(), ts: Date.now(), type: "adjust",
-      itemId: state.items[0].id, qty: 25, unit: 4.20, note: "Startbestand"
-    });
-    persist();
-    hydrateUI();
-    toast("Demo-Daten geladen.");
-  });
-
-  // --- Events: Movement ---
-  formMove.addEventListener("submit", (e) => {
-    e.preventDefault();
-
-    const itemId = moveItem.value;
-    const type = moveType.value;
-    const qty = toInt($("moveQty").value);
-    const unitRaw = $("moveUnit").value.trim();
-    const note = $("moveNote").value.trim();
-
-    const item = state.items.find(i => i.id === itemId);
-    if (!item) return toast("Artikel nicht gefunden.");
-    if (!Number.isFinite(qty) || qty === 0) return toast("Menge muss eine Zahl ungleich 0 sein.");
-
-    let signedQty = qty;
-    if (type === "purchase") signedQty = Math.abs(qty);
-    if (type === "sale") signedQty = -Math.abs(qty);
-    // adjust: qty as given (can be +/-)
-
-    // Unit price fallback
-    let unit = unitRaw === "" ? (type === "sale" ? item.price : item.cost) : toNum(unitRaw);
-    if (unit < 0) return toast("Stückpreis darf nicht negativ sein.");
-
-    // Stock check for sales
-    if (signedQty < 0 && item.stock + signedQty < 0) {
-      return toast("Nicht genug Bestand für diesen Verkauf.");
-    }
-
-    // Apply stock change
-    item.stock += signedQty;
-
-    // Log move
-    state.moves.unshift({
-      id: uid(),
-      ts: Date.now(),
-      type,
-      itemId: item.id,
-      qty: signedQty,
-      unit,
-      note
-    });
-
-    persist();
-    formMove.reset();
-    $("moveQty").value = "1";
-    hydrateUI();
-    toast("Buchung gespeichert.");
-  });
-
-  // Search / filter
-  search.addEventListener("input", hydrateUI);
-  filterStock.addEventListener("change", hydrateUI);
-
-  // Export / Import / Reset
-  $("btnExport").addEventListener("click", exportCSV);
-  $("fileImport").addEventListener("change", importCSV);
-  $("btnReset").addEventListener("click", () => {
-    const ok = confirm("Wirklich alles löschen? Artikel + Historie werden entfernt.");
-    if (!ok) return;
-    localStorage.removeItem(STORAGE_KEY);
-    location.reload();
-  });
-
-  $("btnClearHistory").addEventListener("click", () => {
-    const ok = confirm("Historie wirklich leeren? Bestände bleiben wie sie sind.");
-    if (!ok) return;
-    state.moves = [];
-    persist();
-    hydrateUI();
-  });
-
-  modalClose.addEventListener("click", () => closeModal());
-  modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
-  modalForm.addEventListener("submit", (e) => {
-    e.preventDefault();
-
-    const id = $("editId").value;
-    const item = state.items.find(i => i.id === id);
-    if (!item) return toast("Artikel nicht gefunden.");
-
-    const newSku = $("editSku").value.trim();
-    if (!newSku) return toast("SKU ist Pflicht.");
-    if (newSku !== item.sku && existsSku(newSku)) return toast("SKU existiert bereits.");
-
-    item.sku = newSku;
-    item.name = $("editName").value.trim();
-    item.category = $("editCategory").value.trim();
-    item.supplier = $("editSupplier").value.trim();
-    item.cost = toNum($("editCost").value);
-    item.price = toNum($("editPrice").value);
-    item.stock = toInt($("editStock").value);
-
-    persist();
-    hydrateUI();
-    closeModal();
-    toast("Änderungen gespeichert.");
-
-  });
-
-  function hydrateUI(){
-
-    // Select options
-    moveItem.innerHTML = "";
-    const opt0 = document.createElement("option");
-    opt0.value = "";
-    opt0.textContent = state.items.length ? "Artikel auswählen…" : "Keine Artikel vorhanden";
-    opt0.disabled = true;
-    opt0.selected = true;
-    moveItem.appendChild(opt0);
-
-    state.items
-      .slice()
-      .sort((a,b) => (a.sku.localeCompare(b.sku)))
-      .forEach(i => {
-        const opt = document.createElement("option");
-        opt.value = i.id;
-        opt.textContent = `${i.sku} — ${i.name} (Bestand: ${i.stock})`;
-        moveItem.appendChild(opt);
-      });
-
-    renderItemsTable();
-    renderHistoryTable();
-    renderKPIs();
+  function normalizeHex(v){
+    if(!v) return null;
+    v = String(v).trim();
+    if(!v.startsWith("#")) v = "#" + v;
+    return /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v) ? v.toLowerCase() : null;
   }
 
-  function renderItemsTable(){
-    const q = search.value.trim().toLowerCase();
-    const mode = filterStock.value;
+  // ================== BRAND DEFAULTS (HIER ÄNDERN) ==================
+  const DEFAULTS = {
+    url: "https://standortstark.de",
+    size: 420,
+    margin: 12,
+    ecc: "M",
 
-    let items = state.items.slice();
+    qrBgMode: "solid",     // "solid" | "transparent" (transparent wird für Preview intern auf weiß gemappt)
+    qrBg: "#ffffff",
 
-    if (q) {
-      items = items.filter(i => (
-        i.sku.toLowerCase().includes(q) ||
-        i.name.toLowerCase().includes(q) ||
-        (i.category||"").toLowerCase().includes(q) ||
-        (i.supplier||"").toLowerCase().includes(q)
-      ));
-    }
+    fgMode: "solid",       // "solid" | "gradient-linear" | "gradient-radial" | "multicolor"
+    c1: "#0b1220",         // Anthrazit
+    c2: "#ff8a00",         // Orange
+    c3: "#ffb15a",         // Orange hell
 
-    if (mode === "low") items = items.filter(i => i.stock <= 5);
-    if (mode === "zero") items = items.filter(i => i.stock === 0);
+    dotType: "rounded",
+    cornerSquareType: "extra-rounded",
+    cornerDotType: "dot",
 
-    itemsTbody.innerHTML = "";
+    logoSize: 0.22,
+    logoHideBg: true,
+    logoMargin: 6,
 
-    if (!items.length) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td colspan="9" class="muted">Keine Treffer.</td>`;
-      itemsTbody.appendChild(tr);
-      return;
-    }
+    frameOn: "on",         // "on" | "off"
+    frameStyle: "soft",    // "soft" | "sharp" | "glass"
+    frameColor: "#ff8a00",
+    ctaText: "SCAN ME",
+    ctaPos: "bottom",
+    ctaColor: "#ffffff",
 
-    items
-      .sort((a,b) => a.sku.localeCompare(b.sku))
-      .forEach(item => {
-        const value = item.stock * item.cost;
-        const low = item.stock <= 5 ? `<span class="badge">Low</span>` : "";
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td><span class="badge">${escapeHtml(item.sku)}</span></td>
-          <td>${escapeHtml(item.name)} ${low}</td>
-          <td>${escapeHtml(item.category || "—")}</td>
-          <td>${escapeHtml(item.supplier || "—")}</td>
-          <td class="num">${fmtEUR(item.cost)}</td>
-          <td class="num">${fmtEUR(item.price)}</td>
-          <td class="num">${item.stock}</td>
-          <td class="num">${fmtEUR(value)}</td>
-          <td>
-            <div class="actions-inline">
-              <button class="btn btn-ghost small" data-act="edit" data-id="${item.id}">Bearbeiten</button>
-              <button class="btn btn-danger small" data-act="del" data-id="${item.id}">Löschen</button>
-            </div>
-          </td>
-        `;
-        tr.querySelectorAll("button").forEach(btn => {
-          btn.addEventListener("click", () => handleItemAction(btn.dataset.act, btn.dataset.id));
-        });
-        itemsTbody.appendChild(tr);
-      });
-  }
+    // NEW: CTA typography controls
+    ctaFontSize: 12,       // px
+    ctaFontFamily: "system"// "system" | "inter" | "poppins" | "mono"
+  };
+  // ================================================================
 
-  function renderHistoryTable(){
-    historyTbody.innerHTML = "";
-    const moves = state.moves.slice();
+  // ---------------- DOM ----------------
+  const els = {
+    status: $("statusPill"),
+    toast: $("toast"),
+    meta: $("meta"),
+    shareOut: $("shareOut"),
 
-    if (!moves.length) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td colspan="9" class="muted">Noch keine Buchungen.</td>`;
-      historyTbody.appendChild(tr);
-      return;
-    }
+    type: $("type"),
+    data: $("data"),
+    dataHint: $("dataHint"),
 
-    moves.forEach(m => {
-      const item = state.items.find(i => i.id === m.itemId);
-      const name = item ? item.name : "Gelöschter Artikel";
-      const sku = item ? item.sku : "—";
-      const sum = (m.qty || 0) * (m.unit || 0);
+    dotType: $("dotType"),
+    cornerSquareType: $("cornerSquareType"),
+    cornerDotType: $("cornerDotType"),
+    ecc: $("ecc"),
 
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${fmtDate(m.ts)}</td>
-        <td>${typeLabel(m.type)}</td>
-        <td><span class="badge">${escapeHtml(sku)}</span></td>
-        <td>${escapeHtml(name)}</td>
-        <td class="num">${m.qty}</td>
-        <td class="num">${fmtEUR(m.unit)}</td>
-        <td class="num">${fmtEUR(sum)}</td>
-        <td>${escapeHtml(m.note || "—")}</td>
-        <td>
-          <button class="btn btn-danger small" data-id="${m.id}">Entfernen</button>
-        </td>
-      `;
-      tr.querySelector("button").addEventListener("click", () => deleteMove(m.id));
-      historyTbody.appendChild(tr);
-    });
-  }
+    size: $("size"), sizeVal: $("sizeVal"),
+    margin: $("margin"), marginVal: $("marginVal"),
 
-  function renderKPIs(){
-    $("kpiItems").textContent = String(state.items.length);
+    bgMode: $("bgMode"),
+    bgColor: $("bgColor"), bgHex: $("bgHex"),
 
-    const totalStock = state.items.reduce((a,i) => a + (i.stock||0), 0);
-    $("kpiStock").textContent = String(totalStock);
+    fgMode: $("fgMode"),
+    fgColor1: $("fgColor1"), fgHex1: $("fgHex1"),
+    fgColor2: $("fgColor2"), fgHex2: $("fgHex2"),
+    fgColor3: $("fgColor3"), fgHex3: $("fgHex3"),
+    fgExtraRow: $("fgExtraRow"),
 
-    const totalValue = state.items.reduce((a,i) => a + (i.stock||0) * (i.cost||0), 0);
-    $("kpiValue").textContent = fmtEUR(totalValue);
+    glow: $("glow"), glowVal: $("glowVal"),
+    scale: $("scale"),
 
-    const revenue = state.moves
-      .filter(m => m.type === "sale")
-      .reduce((a,m) => a + (Math.abs(m.qty||0) * (m.unit||0)), 0);
-    $("kpiRevenue").textContent = fmtEUR(revenue);
-  }
+    logoFile: $("logoFile"),
+    logoSize: $("logoSize"), logoSizeVal: $("logoSizeVal"),
+    logoHideBg: $("logoHideBg"),
+    logoMargin: $("logoMargin"), logoMarginVal: $("logoMarginVal"),
 
-  function handleItemAction(act, id){
-    const item = state.items.find(i => i.id === id);
-    if (!item) return;
+    frameOn: $("frameOn"),
+    frameStyle: $("frameStyle"),
+    ctaText: $("ctaText"),
+    ctaPos: $("ctaPos"),
+    frameColor: $("frameColor"), frameHex: $("frameHex"),
+    ctaColor: $("ctaColor"), ctaHex: $("ctaHex"),
 
-    if (act === "edit") return openEdit(item);
+    // NEW: CTA typography dropdowns
+    ctaFontSize: $("ctaFontSize"),
+    ctaFontFamily: $("ctaFontFamily"),
 
-    if (act === "del") {
-      const ok = confirm(`Artikel "${item.sku} – ${item.name}" wirklich löschen? Historie bleibt (mit Hinweis).`);
-      if (!ok) return;
-      state.items = state.items.filter(i => i.id !== id);
-      persist();
-      hydrateUI();
-      toast("Artikel gelöscht.");
-    }
-  }
+    frame: $("frame"),
+    cta: $("cta"),
+    stage: $("stage"),
+    mount: $("qrMount"),
 
-  function deleteMove(id){
-    const ok = confirm("Diese Buchung entfernen? Achtung: Bestand wird NICHT automatisch zurückgerechnet.");
-    if (!ok) return;
-    state.moves = state.moves.filter(m => m.id !== id);
-    persist();
-    hydrateUI();
-  }
+    btnDownload: $("btnDownload"),
+    btnCopy: $("btnCopy"),
+    btnReset: $("btnReset"),
+    btnShare: $("btnShare"),
+    btnTest: $("btnTest"),
+    btnExportSvg: $("btnExportSvg"),
+  };
 
-  function openEdit(item){
-    $("editId").value = item.id;
-    $("editSku").value = item.sku;
-    $("editName").value = item.name;
-    $("editCategory").value = item.category || "";
-    $("editSupplier").value = item.supplier || "";
-    $("editCost").value = String(item.cost ?? 0);
-    $("editPrice").value = String(item.price ?? 0);
-    $("editStock").value = String(item.stock ?? 0);
-
-    modal.setAttribute("aria-hidden", "false");
-  }
-
-  function closeModal(){
-    modal.setAttribute("aria-hidden", "true");
-  }
-
-  function loadState(){
-    try{
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if(!raw) return { items: [], moves: [] };
-      const parsed = JSON.parse(raw);
-      // minimal validation
-      return {
-        items: Array.isArray(parsed.items) ? parsed.items : [],
-        moves: Array.isArray(parsed.moves) ? parsed.moves : []
-      };
-    }catch{
-      return { items: [], moves: [] };
-    }
-  }
-
-  function persist(){
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }
-
-  function exportCSV(){
-    const lines = [];
-    lines.push("SECTION,items");
-    lines.push("id,sku,name,category,supplier,cost,price,stock");
-    state.items.forEach(i => {
-      lines.push([
-        i.id, csv(i.sku), csv(i.name), csv(i.category||""), csv(i.supplier||""),
-        num(i.cost), num(i.price), int(i.stock)
-      ].join(","));
-    });
-
-    lines.push("");
-    lines.push("SECTION,moves");
-    lines.push("id,ts,type,itemId,qty,unit,note");
-    state.moves.forEach(m => {
-      lines.push([
-        m.id, m.ts, m.type, m.itemId, int(m.qty), num(m.unit), csv(m.note||"")
-      ].join(","));
-    });
-
-    const blob = new Blob([lines.join("\n")], { type:"text/csv;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `stockpilot_export_${new Date().toISOString().slice(0,10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  async function importCSV(e){
-    const file = e.target.files?.[0];
-    if(!file) return;
-    const text = await file.text();
-    const ok = confirm("Import überschreibt NICHT automatisch. Ich mische Daten ein (IDs bleiben). Fortfahren?");
-    if(!ok){ e.target.value=""; return; }
-
-    const rows = parseCSV(text);
-
-    let section = "";
-    for (const row of rows){
-      if(row[0] === "SECTION"){
-        section = row[1] || "";
-        continue;
-      }
-      if(!section) continue;
-      if(row[0] === "id") continue; // header
-
-      if(section === "items"){
-        const [id, sku, name, category, supplier, cost, price, stock] = row;
-        if(!id || !sku || !name) continue;
-        // skip if already exists by id
-        if(state.items.some(x => x.id === id)) continue;
-        // also prevent sku collisions
-        if(existsSku(sku)) continue;
-
-        state.items.push({
-          id,
-          sku,
-          name,
-          category: category || "",
-          supplier: supplier || "",
-          cost: toNum(cost),
-          price: toNum(price),
-          stock: toInt(stock)
-        });
-      }
-
-      if(section === "moves"){
-        const [id, ts, type, itemId, qty, unit, note] = row;
-        if(!id || !ts || !type || !itemId) continue;
-        if(state.moves.some(x => x.id === id)) continue;
-        state.moves.push({
-          id,
-          ts: Number(ts),
-          type,
-          itemId,
-          qty: toInt(qty),
-          unit: toNum(unit),
-          note: note || ""
-        });
-      }
-    }
-
-    state.moves.sort((a,b) => b.ts - a.ts);
-
-    persist();
-    hydrateUI();
-    toast("Import abgeschlossen.");
-    e.target.value = "";
-  }
-  
-  function existsSku(sku){
-    return state.items.some(i => i.sku.toLowerCase() === sku.toLowerCase());
-  }
-
-  function toNum(v){
-    const n = Number(String(v).replace(",", "."));
-    return Number.isFinite(n) ? n : 0;
-  }
-  function toInt(v){
-    const n = parseInt(String(v), 10);
-    return Number.isFinite(n) ? n : 0;
-  }
-  function num(v){ return Number.isFinite(v) ? String(v) : String(toNum(v)); }
-  function int(v){ return String(toInt(v)); }
-
-  function typeLabel(t){
-    if(t === "purchase") return "Einkauf";
-    if(t === "sale") return "Verkauf";
-    return "Korrektur";
-  }
-
-  function escapeHtml(s){
-    return String(s).replace(/[&<>"']/g, (c) => ({
-      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
-    }[c]));
-  }
-
-  function csv(value){
-    const s = String(value ?? "");
-    if(/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-    return s;
-  }
-
-  function parseCSV(text){
-    const rows = [];
-    let row = [];
-    let cur = "";
-    let inQ = false;
-
-    for(let i=0;i<text.length;i++){
-      const ch = text[i];
-      const next = text[i+1];
-
-      if(inQ){
-        if(ch === '"' && next === '"'){ cur += '"'; i++; continue; }
-        if(ch === '"'){ inQ = false; continue; }
-        cur += ch; continue;
-      } else {
-        if(ch === '"'){ inQ = true; continue; }
-        if(ch === ","){ row.push(cur); cur=""; continue; }
-        if(ch === "\n"){
-          row.push(cur); rows.push(row);
-          row=[]; cur=""; continue;
-        }
-        if(ch === "\r") continue;
-        cur += ch;
-      }
-    }
-    row.push(cur);
-    rows.push(row);
-    return rows.map(r => r.map(x => x.trim())).filter(r => r.some(x => x !== ""));
-  }
-
-
-  let toastTimer = null;
+  // ---------------- UI feedback ----------------
   function toast(msg){
-    clearTimeout(toastTimer);
-    let el = document.getElementById("toast");
-    if(!el){
-      el = document.createElement("div");
-      el.id = "toast";
-      el.style.position = "fixed";
-      el.style.left = "50%";
-      el.style.bottom = "18px";
-      el.style.transform = "translateX(-50%)";
-      el.style.padding = "10px 12px";
-      el.style.borderRadius = "14px";
-      el.style.background = "rgba(0,0,0,.60)";
-      el.style.border = "1px solid rgba(255,255,255,.12)";
-      el.style.color = "white";
-      el.style.zIndex = "999";
-      el.style.backdropFilter = "blur(8px)";
-      el.style.boxShadow = "0 18px 60px rgba(0,0,0,.35)";
-      document.body.appendChild(el);
-    }
-    el.textContent = msg;
-    el.style.opacity = "1";
-    toastTimer = setTimeout(() => { el.style.opacity = "0"; }, 2200);
+    if (!els.toast) return;
+    els.toast.textContent = msg;
+    els.toast.classList.add("show");
+    setTimeout(() => els.toast.classList.remove("show"), 1400);
   }
-})();
+
+  function setStatus(text, tone="neutral"){
+    if (!els.status) return;
+    els.status.textContent = text;
+    els.status.style.color =
+      tone === "ok" ? "#38d37a" :
+      tone === "warn" ? "#ffcc66" :
+      "rgba(255,255,255,.62)";
+  }
+
+  // ---------------- hard guards ----------------
+  if (!els.mount) {
+    console.error("FEHLT: <div id='qrMount'></div> im HTML.");
+    setStatus("Vorschau-Mount fehlt", "warn");
+    return;
+  }
+
+  if (!window.QRCodeStyling) {
+    console.error("QR Lib fehlt: qr-code-styling CDN wird nicht geladen oder falsche Reihenfolge.");
+    setStatus("QR Lib fehlt", "warn");
+    return;
+  }
+
+  // ---------------- Color sync (picker <-> hex) ----------------
+  function bindColorPair(colorEl, hexEl){
+    if (!colorEl || !hexEl) return;
+
+    const start = normalizeHex(hexEl.value) || normalizeHex(colorEl.value) || "#ffffff";
+    colorEl.value = start;
+    hexEl.value = start;
+
+    on(colorEl, "input", () => {
+      hexEl.value = String(colorEl.value).toLowerCase();
+      update();
+    });
+
+    on(hexEl, "input", () => {
+      const hx = normalizeHex(hexEl.value);
+      if (hx) { colorEl.value = hx; update(); }
+    });
+  }
+
+  bindColorPair(els.bgColor, els.bgHex);
+  bindColorPair(els.fgColor1, els.fgHex1);
+  bindColorPair(els.fgColor2, els.fgHex2);
+  bindColorPair(els.fgColor3, els.fgHex3);
+  bindColorPair(els.frameColor, els.frameHex);
+  bindColorPair(els.ctaColor, els.ctaHex);
+
+  // ---------------- State ----------------
+  const state = { logoDataUrl: null, updating: false };
+
+  // ---------------- QR Instance ----------------
+  const qr = new QRCodeStyling({
+    width: DEFAULTS.size,
+    height: DEFAULTS.size,
+    type: "canvas",
+    data: DEFAULTS.url,
+    margin: DEFAULTS.margin,
+    qrOptions: { errorCorrectionLevel: DEFAULTS.ecc },
+
+    backgroundOptions: { color: DEFAULTS.qrBg },
+    dotsOptions: { type: DEFAULTS.dotType, color: DEFAULTS.c1 },
+    cornersSquareOptions: { type: DEFAULTS.cornerSquareType, color: DEFAULTS.c1 },
+    cornersDotOptions: { type: DEFAULTS.cornerDotType, color: DEFAULTS.c1 },
+
+    imageOptions: { hideBackgroundDots: DEFAULTS.logoHideBg, imageSize: DEFAULTS.logoSize, margin: DEFAULTS.logoMargin }
+  });
+
+  function mountQr(){
+    els.mount.innerHTML = "";
+    qr.append(els.mount);
+
+    // stacking: Frame/CTA immer über QR
+    els.mount.style.position = "relative";
+    els.mount.style.zIndex = "1";
+    if (els.stage) els.stage.style.position = "relative";
+    if (els.frame) { els.frame.style.position = "absolute"; els.frame.style.zIndex = "5"; }
+    if (els.cta)   { els.cta.style.position = "absolute";   els.cta.style.zIndex = "6"; }
+  }
+
+  mountQr();
+
+  // ---------------- defaults into UI ----------------
+  function applyDefaultsToUI(){
+    if (els.data) els.data.value = DEFAULTS.url;
+
+    if (els.size) els.size.value = String(DEFAULTS.size);
+    if (els.margin) els.margin.value = String(DEFAULTS.margin);
+    if (els.ecc) els.ecc.value = DEFAULTS.ecc;
+
+    if (els.bgMode) els.bgMode.value = DEFAULTS.qrBgMode;
+    if (els.bgColor) els.bgColor.value = DEFAULTS.qrBg;
+    if (els.bgHex) els.bgHex.value = DEFAULTS.qrBg;
+
+    if (els.fgMode) els.fgMode.value = DEFAULTS.fgMode;
+    if (els.fgColor1) els.fgColor1.value = DEFAULTS.c1;
+    if (els.fgHex1) els.fgHex1.value = DEFAULTS.c1;
+    if (els.fgColor2) els.fgColor2.value = DEFAULTS.c2;
+    if (els.fgHex2) els.fgHex2.value = DEFAULTS.c2;
+    if (els.fgColor3) els.fgColor3.value = DEFAULTS.c3;
+    if (els.fgHex3) els.fgHex3.value = DEFAULTS.c3;
+
+    if (els.dotType) els.dotType.value = DEFAULTS.dotType;
+    if (els.cornerSquareType) els.cornerSquareType.value = DEFAULTS.cornerSquareType;
+    if (els.cornerDotType) els.cornerDotType.value = DEFAULTS.cornerDotType;
+
+    if (els.logoSize) els.logoSize.value = String(DEFAULTS.logoSize);
+    if (els.logoHideBg) els.logoHideBg.value = DEFAULTS.logoHideBg ? "true" : "false";
+    if (els.logoMargin) els.logoMargin.value = String(DEFAULTS.logoMargin);
+
+    if (els.frameOn) els.frameOn.value = DEFAULTS.frameOn;
+    if (els.frameStyle) els.frameStyle.value = DEFAULTS.frameStyle;
+    if (els.ctaText) els.ctaText.value = DEFAULTS.ctaText;
+    if (els.ctaPos) els.ctaPos.value = DEFAULTS.ctaPos;
+
+    if (els.frameColor) els.frameColor.value = DEFAULTS.frameColor;
+    if (els.frameHex) els.frameHex.value = DEFAULTS.frameColor;
+
+    if (els.ctaColor) els.ctaColor.value = DEFAULTS.ctaColor;
+    if (els.ctaHex) els.ctaHex.value = DEFAULTS.ctaColor;
+
+    // NEW typography defaults
+    if (els.ctaFontSize) els.ctaFontSize.value = String(DEFAULTS.ctaFontSize);
+    if (els.ctaFontFamily) els.ctaFontFamily.value = DEFAULTS.ctaFontFamily;
+  }
+
+  applyDefaultsToUI();
+
+  // ---------------- logic ----------------
+  function normalizeData(){
+    const raw = (els.data?.value || "").trim();
+    const t = (els.type?.value || "url");
+
+    if (!raw) return { ok:false, data:"", hint:"Bitte Inhalt eingeben." };
+
+    if (t === "url") {
+      const looksLikeScheme = /^(https?:\/\/|mailto:|tel:|sms:|bitcoin:|geo:|WIFI:|BEGIN:VCARD|BEGIN:VEVENT)/i.test(raw);
+      if (!looksLikeScheme) return { ok:true, data:`https://${raw}`, hint:"https:// ergänzt" };
+      return { ok:true, data:raw, hint:"URL aktiv" };
+    }
+    return { ok:true, data:raw, hint:"Text aktiv" };
+  }
+
+  function buildDotsColor(){
+    const c1 = normalizeHex(els.fgHex1?.value) || els.fgColor1?.value || DEFAULTS.c1;
+    const c2 = normalizeHex(els.fgHex2?.value) || els.fgColor2?.value || DEFAULTS.c2;
+    const c3 = normalizeHex(els.fgHex3?.value) || els.fgColor3?.value || DEFAULTS.c3;
+
+    const mode = els.fgMode?.value || DEFAULTS.fgMode;
+    if (mode === "solid") return { color: c1 };
+
+    const gradientType = (mode === "gradient-radial" || mode === "multicolor") ? "radial" : "linear";
+    return {
+      gradient: {
+        type: gradientType,
+        rotation: 0,
+        colorStops: [
+          { offset: 0, color: c1 },
+          { offset: 0.5, color: c2 },
+          { offset: 1, color: c3 },
+        ]
+      }
+    };
+  }
+
+  function showFgExtras(){
+    if (!els.fgExtraRow || !els.fgMode) return;
+    els.fgExtraRow.style.display = (els.fgMode.value !== "solid") ? "grid" : "none";
+  }
+
+  function applyFrameAndCta(){
+    if (!els.frame || !els.cta || !els.frameOn) return;
+
+    if (els.frameOn.value !== "on") {
+      els.frame.classList.add("hidden");
+      return;
+    }
+    els.frame.classList.remove("hidden");
+
+    const frameCol = normalizeHex(els.frameHex?.value) || els.frameColor?.value || DEFAULTS.frameColor;
+    const ctaCol   = normalizeHex(els.ctaHex?.value)   || els.ctaColor?.value   || DEFAULTS.ctaColor;
+    const style    = els.frameStyle?.value || DEFAULTS.frameStyle;
+
+    els.frame.style.inset = "18px";
+    els.frame.style.pointerEvents = "none";
+
+    if (style === "glass") {
+      els.frame.style.border = "1px solid rgba(255,255,255,.18)";
+      els.frame.style.background = "linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.05))";
+      els.frame.style.boxShadow = "inset 0 0 0 1px rgba(255,255,255,.10), 0 18px 60px rgba(0,0,0,.35)";
+      els.frame.style.borderRadius = "22px";
+    } else if (style === "sharp") {
+      els.frame.style.border = `2px solid ${frameCol}`;
+      els.frame.style.background = "transparent";
+      els.frame.style.boxShadow = "0 18px 60px rgba(0,0,0,.35)";
+      els.frame.style.borderRadius = "12px";
+    } else {
+      els.frame.style.border = `2px solid ${frameCol}`;
+      els.frame.style.background = "transparent";
+      els.frame.style.boxShadow = "inset 0 0 0 1px rgba(255,255,255,.10), 0 18px 60px rgba(0,0,0,.35)";
+      els.frame.style.borderRadius = "22px";
+    }
+
+    els.cta.textContent = (els.ctaText?.value || DEFAULTS.ctaText).trim() || DEFAULTS.ctaText;
+    const pos = (els.ctaPos?.value === "top") ? "top" : "bottom";
+    els.cta.className = `cta ${pos}`;
+
+    els.cta.style.backgroundColor = (style === "glass") ? "rgba(0,0,0,.35)" : frameCol;
+    els.cta.style.color = ctaCol;
+    els.cta.style.border = "1px solid rgba(255,255,255,.16)";
+    els.cta.style.backdropFilter = "blur(10px)";
+
+    // ---- NEW: CTA Typography (safe overlay only) ----
+    const fs = parseInt(els.ctaFontSize?.value || DEFAULTS.ctaFontSize, 10);
+    els.cta.style.fontSize = `${clamp(fs || DEFAULTS.ctaFontSize, 9, 22)}px`;
+
+    const fam = (els.ctaFontFamily?.value || DEFAULTS.ctaFontFamily);
+    els.cta.style.fontFamily =
+      fam === "inter" ? "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" :
+      fam === "poppins" ? "Poppins, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" :
+      fam === "mono" ? "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" :
+      "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto";
+  }
+
+  function update(){
+    if (state.updating) return;
+    state.updating = true;
+
+    try{
+      const norm = normalizeData();
+      setText(els.dataHint, norm.hint);
+
+      setText(els.sizeVal, String(els.size?.value ?? ""));
+      setText(els.marginVal, String(els.margin?.value ?? ""));
+      setText(els.glowVal, String(els.glow?.value ?? ""));
+      setText(els.logoSizeVal, els.logoSize ? Number(els.logoSize.value).toFixed(2) : "");
+      setText(els.logoMarginVal, String(els.logoMargin?.value ?? ""));
+
+      showFgExtras();
+
+      const size = clamp(parseInt(els.size?.value, 10) || DEFAULTS.size, 180, 900);
+      const margin = clamp(parseInt(els.margin?.value, 10) || DEFAULTS.margin, 0, 40);
+      const ecc = els.ecc?.value || DEFAULTS.ecc;
+
+      // preview-safe: transparent => white (sonst „verschwindet“ QR auf dunklem UI)
+      const bgMode = els.bgMode?.value || DEFAULTS.qrBgMode;
+      const bgColor =
+        bgMode === "transparent"
+          ? DEFAULTS.qrBg
+          : (normalizeHex(els.bgHex?.value) || els.bgColor?.value || DEFAULTS.qrBg);
+
+      const primary = normalizeHex(els.fgHex1?.value) || els.fgColor1?.value || DEFAULTS.c1;
+
+      qr.update({
+        width: size,
+        height: size,
+        data: norm.ok ? norm.data : "",
+        margin,
+        qrOptions: { errorCorrectionLevel: ecc },
+        backgroundOptions: { color: bgColor },
+
+        dotsOptions: { type: els.dotType?.value || DEFAULTS.dotType, ...buildDotsColor() },
+        cornersSquareOptions: { type: els.cornerSquareType?.value || DEFAULTS.cornerSquareType, color: primary },
+        cornersDotOptions: { type: els.cornerDotType?.value || DEFAULTS.cornerDotType, color: primary },
+
+        image: state.logoDataUrl || undefined,
+        imageOptions: {
+          hideBackgroundDots: (els.logoHideBg?.value ?? (DEFAULTS.logoHideBg ? "true" : "false")) === "true",
+          imageSize: clamp(parseFloat(els.logoSize?.value) || DEFAULTS.logoSize, 0, 0.42),
+          margin: clamp(parseInt(els.logoMargin?.value, 10) || DEFAULTS.logoMargin, 0, 20)
+        }
+      });
+
+      applyFrameAndCta();
+      setText(els.meta, `${size}px • ECC ${ecc} • ${els.fgMode?.value || DEFAULTS.fgMode}`);
+      setStatus("Ready", "ok");
+    } catch(e){
+      console.error(e);
+      setStatus("Render Error", "warn");
+      toast("Render Error – Konsole checken");
+    } finally {
+      state.updating = false;
+    }
+  }
+
+  // ---------------- events (crash-safe) ----------------
+  const liveIds = [
+    "type","data",
+    "dotType","cornerSquareType","cornerDotType","ecc",
+    "size","margin","bgMode","fgMode","glow","scale",
+    "logoSize","logoHideBg","logoMargin",
+    "frameOn","frameStyle","ctaText","ctaPos",
+    // NEW typography controls
+    "ctaFontSize","ctaFontFamily"
+  ];
+  liveIds.forEach(id => {
+    const el = $(id);
+    on(el, "input", update);
+    on(el, "change", update);
+  });
+
+  on(els.logoFile, "change", () => {
+    const f = els.logoFile.files?.[0];
+    if (!f) { state.logoDataUrl = null; update(); return; }
+    const r = new FileReader();
+    r.onload = () => { state.logoDataUrl = r.result; toast("Logo geladen"); update(); };
+    r.readAsDataURL(f);
+  });
+
+  on(els.btnDownload, "click", async () => {
+    try{
+      setStatus("Export…", "neutral");
+      await qr.download({ extension: "png", name: `qr_${Date.now()}` });
+      setStatus("Downloaded", "ok");
+      toast("PNG exportiert");
+    } catch(e){
+      console.error(e);
+      setStatus("Export Error", "warn");
+      toast("PNG Export fehlgeschlagen");
+    }
+  });
+
+  on(els.btnExportSvg, "click", async () => {
+    try{
+      setStatus("Export…", "neutral");
+      await qr.download({ extension: "svg", name: `qr_${Date.now()}` });
+      setStatus("SVG Ready", "ok");
+      toast("SVG exportiert");
+    } catch(e){
+      console.error(e);
+      setStatus("SVG Error", "warn");
+      toast("SVG Export fehlgeschlagen");
+    }
+  });
+
+  on(els.btnCopy, "click", async () => {
+    try{
+      setStatus("Copy…", "neutral");
+      const blob = await qr.getRawData("png");
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      setStatus("Copied", "ok");
+      toast("QR kopiert");
+    } catch(e){
+      console.error(e);
+      setStatus("Copy Error", "warn");
+      toast("Clipboard blockiert (Browser/HTTPS)");
+    }
+  });
+
+  on(els.btnReset, "click", () => location.reload());
+  on(els.btnTest, "click", () => toast("Scan-Test: Kamera-App / Google Lens. Mit Logo => ECC Q/H."));
+
+  // ---------------- boot ----------------
+  update();
+});

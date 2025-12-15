@@ -1,17 +1,40 @@
 {
-  "name": "stockpilot",
+  "name": "qr-generator-pro",
   "version": "1.0.0",
-  "description": "",
-  "main": "app.js",
+  "description": "QR Code Generator mit Design-Optionen",
+  "author": "Sebastian Teipen",
+  "license": "MIT",
+  "type": "module",
+  "main": "electron-main.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "electron .",
+    "dist": "electron-builder"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "express": "^5.2.1"
+  "build": {
+    "appId": "de.sebastianteipen.qrschmiede",
+    "productName": "QR-Schmiede",
+    "files": [
+      "index.html",
+      "*.html",
+      "app.js",
+      "style.css",
+      "assets/**",
+      "electron-main.js",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^24.13.3"
   }
 }
